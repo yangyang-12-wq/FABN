@@ -1,12 +1,11 @@
-import copy
-import math
 import dgl
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from graph_learner import *
-from layers import GCNConv_dense, GCNConv_dgl
 from torch.nn import Sequential, Linear, ReLU
-from torch_geometric.nn import global_mean_pool
-from torch_geometric.utils import to_dense_adj,dense_to_sparse 
+from torch_geometric.nn import global_mean_pool, GCNConv
+from torch_geometric.utils import to_dense_adj, dense_to_sparse 
 EPS = 1e-12
 def _adj_to_dense(adj, n_nodes=None, device=None):
     """
@@ -61,149 +60,97 @@ def _adj_to_dense(adj, n_nodes=None, device=None):
             return A_sparse.to_dense().float()
 
     raise TypeError(f"Unsupported adj type: {type(adj)}. Provide DGLGraph / sparse_coo / dense tensor / (edge_index, n_nodes).")
-# GCN for evaluation.
-class GCN(nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, num_layers, dropout, dropout_adj, Adj, sparse):
-        super(GCN, self).__init__()
-        self.layers = nn.ModuleList()
-
-        if sparse:
-            self.layers.append(GCNConv_dgl(in_channels, hidden_channels))
-            for _ in range(num_layers - 2):
-                self.layers.append(GCNConv_dgl(hidden_channels, hidden_channels))
-            self.layers.append(GCNConv_dgl(hidden_channels, out_channels))
-        else:
-            self.layers.append(GCNConv_dense(in_channels, hidden_channels))
-            for i in range(num_layers - 2):
-                self.layers.append(GCNConv_dense(hidden_channels, hidden_channels))
-            self.layers.append(GCNConv_dense(hidden_channels, out_channels))
-        self.dropout = dropout
-        self.Adj = Adj
-        self.Adj.requires_grad = False
-        self.dropout_adj = nn.Dropout(p=dropout_adj)
-        self.sparse = sparse
-
-    def forward(self, x):
-        Adj = copy.deepcopy(self.Adj)
-        if self.sparse:
-            Adj.edata['w'] = self.dropout_adj(Adj.edata['w'])
-        else:
-            Adj = self.dropout_adj(Adj)
-
-        for i, conv in enumerate(self.layers[:-1]):
-            x = conv(x, Adj)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-        x = self.layers[-1](x, Adj)
-        return x
 
 
-class GraphEncoder(nn.Module):
-    def __init__(self, nlayers, in_dim, hidden_dim, emb_dim, dropout, sparse):
+def _adj_to_edge_index_and_weight(adj, device):
+    """
+    将多种邻接表示统一为 PyG GCNConv 可用的 (edge_index, edge_weight)。
+    支持：DGLGraph / sparse_coo / dense / (edge_index, num_nodes / edge_weight)
+    """
+    if adj is None:
+        empty_idx = torch.empty((2, 0), dtype=torch.long, device=device)
+        return empty_idx, None
 
-        super(GraphEncoder, self).__init__()
-        self.dropout = dropout
-        self.gnn_encoder_layers = nn.ModuleList()
-        self.act = nn.LeakyReLU(0.2) 
-        self.num_g = 2  
-        if sparse:
-            self.gnn_encoder_layers.append(GCNConv_dgl(in_dim, hidden_dim))
-            for _ in range(nlayers - 2):
-                self.gnn_encoder_layers.append(GCNConv_dgl(hidden_dim, hidden_dim))
-            self.gnn_encoder_layers.append(GCNConv_dgl(hidden_dim, emb_dim))
-        else:
-            self.gnn_encoder_layers.append(GCNConv_dense(in_dim, hidden_dim))
-            for _ in range(nlayers - 2):
-                self.gnn_encoder_layers.append(GCNConv_dense(hidden_dim, hidden_dim))
-            self.gnn_encoder_layers.append(GCNConv_dense(hidden_dim, emb_dim))
-        self.sparse = sparse
+    if isinstance(adj, (dgl.DGLGraph, dgl.DGLHeteroGraph)):
+        u, v = adj.edges()
+        edge_index = torch.stack([u, v], dim=0).to(device)
+        edge_weight = adj.edata['w'].to(device) if 'w' in adj.edata else None
+        return edge_index, edge_weight
 
-    def forward(self, x, Adj):
-        initial_x = x
-        for i, conv in enumerate(self.gnn_encoder_layers):
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            x = conv(x, Adj)
-            if i < len(self.gnn_encoder_layers) - 1:
-                x = self.act(x)
-                if x.shape == initial_x.shape:
-                    x = x + initial_x
-        return x
-    def cal_custom_loss(self, z_specific_adjs, z_fused_adj, specific_adjs, 
-                       temperature=1.0, h=1.0, alpha=1.0, beta=1.0, gamma=1.0):
+    if isinstance(adj, torch.Tensor) and adj.is_sparse:
+        adj = adj.coalesce()
+        return adj.indices().to(device), adj.values().to(device)
 
-        
-        # 1. LFD损失: 融合视图与局部邻居聚合的对齐
-        lfd_loss_total = 0
-        for i in range(self.num_g):
-            lfd_loss = compute_lfd_loss_optimized(
-                z_teacher=z_specific_adjs[i],
-                h_student=z_fused_adj,
-                adj_teacher=specific_adjs[i],
-                temperature=temperature
-            )
-            lfd_loss_total += lfd_loss
-        lfd_loss_avg = lfd_loss_total / self.num_g
-        
-        # 2. S_High损失: 鼓励每个view在自己的图上保持平滑性（低高频能量）
-        s_high_same = [] 
-        s_high_cross = [] 
-        
-        for i in range(self.num_g):
-            s_high_same.append(compute_s_high(z_specific_adjs[i], specific_adjs[i]))
-        
-            for j in range(self.num_g):
-                if i != j:
-                    s_high_cross.append(compute_s_high(z_specific_adjs[i], specific_adjs[j]))
+    if isinstance(adj, torch.Tensor):
+        rows, cols = torch.nonzero(adj, as_tuple=True)
+        if rows.numel() == 0:
+            empty_idx = torch.empty((2, 0), dtype=torch.long, device=device)
+            return empty_idx, None
+        edge_index = torch.stack([rows, cols], dim=0).to(device)
+        edge_weight = adj[rows, cols].to(device)
+        return edge_index, edge_weight
 
-        s_high_same_avg = torch.stack(s_high_same).mean()
-        s_high_cross_avg = torch.stack(s_high_cross).mean()
-       
-        s_high_loss_avg = torch.clamp(s_high_same_avg - s_high_cross_avg + 1.0, min=0.0)
-        
-        # 3. SC损失: 不同视图间的分布相似性
-        sc_loss_total = 0
-        count = 0
-        
-        # 特定视图之间的SC损失
-        for i in range(self.num_g):
-            for j in range(i+1, self.num_g):
-                sc_loss = compute_sc_loss(
-                    Z_s_intra=z_specific_adjs[i],
-                    Z_s_global=z_specific_adjs[j],
-                    h=h
-                )
-                sc_loss_total += sc_loss
-                count += 1
-        
-        sc_loss_avg = sc_loss_total / count if count > 0 else torch.tensor(0.0)
-        
+    if isinstance(adj, (list, tuple)) and len(adj) >= 1:
+        edge_index = adj[0].to(device)
+        edge_weight = None
+        # tuple可能是 (edge_index, num_nodes) 或 (edge_index, edge_weight)
+        if len(adj) >= 2 and isinstance(adj[1], torch.Tensor):
+            if adj[1].dim() == 1 and adj[1].numel() == edge_index.shape[1]:
+                edge_weight = adj[1].to(device)
+        return edge_index, edge_weight
 
-        total_loss = (alpha * lfd_loss_avg + 
-                     beta * s_high_loss_avg + 
-                     gamma * sc_loss_avg)
-        
-        loss_details = {
-            'lfd_loss': lfd_loss_avg,
-            's_high_loss': s_high_loss_avg,
-            'sc_loss': sc_loss_avg,
-            'total_loss': total_loss
-        }
-        return total_loss, loss_details
-        
-class GraphEncoderWithPooling(nn.Module):
-    def __init__(self, nlayers, in_dim, hidden_dim, emb_dim, dropout, sparse):
+    raise TypeError(f"Unsupported adj type for edge_index conversion: {type(adj)}")
+
+
+    
+class ViewEncoder(nn.Module):
+    """
+    三层GCN编码器：在静态视图上进行特征提取
+    返回节点级表示，用于后续的多视图融合
+    """
+    def __init__(self, in_dim, hidden_dim, emb_dim, dropout, sparse=False):
         super().__init__()
-        self.encoder = GraphEncoder(nlayers, in_dim, hidden_dim, emb_dim, dropout, sparse)
-    def forward(self, x, adj,batch_vec):
-        node_embedding=self.encoder(x,adj)
-        node_embedding=F.normalize(node_embedding,dim=1,p=2)
-        graph_embedding=global_mean_pool(node_embedding,batch_vec)
-        return graph_embedding
+        self.dropout = dropout
+        self.sparse = sparse  
+        
+        # 三层GCN（PyG实现，关闭内部自环与归一化，保持与输入邻接一致）
+        self.conv1 = GCNConv(in_dim, hidden_dim, add_self_loops=False, normalize=False)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim, add_self_loops=False, normalize=False)
+        self.conv3 = GCNConv(hidden_dim, emb_dim, add_self_loops=False, normalize=False)
+        
+        self.act = nn.ReLU()
+        
+    def forward(self, x, adj):
+        """
+        x: [N, in_dim] 节点特征
+        adj: 静态邻接矩阵（sparse_coo_tensor或DGLGraph）
+        返回: [N, emb_dim] 节点级表示
+        """
+        edge_index, edge_weight = _adj_to_edge_index_and_weight(adj, x.device)
+
+        # Layer 1
+        h1 = self.conv1(x, edge_index, edge_weight)
+        h1 = self.act(h1)
+        h1 = F.dropout(h1, p=self.dropout, training=self.training)
+        
+        # Layer 2
+        h2 = self.conv2(h1, edge_index, edge_weight)
+        h2 = self.act(h2)
+        h2 = F.dropout(h2, p=self.dropout, training=self.training)
+        h2 = h2 + h1  
+        
+        # Layer 3
+        h3 = self.conv3(h2, edge_index, edge_weight)
+        
+        return h3  #
+
 
 class GraphClassifierHead(torch.nn.Module):
     def __init__(self, in_dim, nclasses):
         super().__init__()
-        self.linear = nn.Linear(in_dim, nclasses)
+        out_dim = 1 if nclasses == 2 else nclasses
+        self.out_dim = out_dim
+        self.linear = nn.Linear(in_dim, out_dim)
         
         nn.init.xavier_uniform_(self.linear.weight)
         nn.init.zeros_(self.linear.bias)  
@@ -211,21 +158,68 @@ class GraphClassifierHead(torch.nn.Module):
     def forward(self, graph_emb):
         graph_emb = F.normalize(graph_emb, p=2, dim=1)
         logits = self.linear(graph_emb)
+        if self.out_dim == 1:
+            return logits.squeeze(-1)
         return logits
 
-def AGG(h_list, adjs_o, nlayer, sparse=False):
-    f_list = []
-    for i in range(len(adjs_o)):
-        z = h_list[i]
-        adj = adjs_o[i]
-        for i in range(nlayer):
-            if sparse:
-                z = torch.sparse.mm(adj, z)
-            else:
-                z = torch.matmul(adj, z)
-        f_list.append(z)
+def compute_self_supervised_loss(z_specific_adjs, z_fused_adj, specific_adjs, 
+                                  temperature=1.0, h=1.0, alpha=1.0, beta=0.0):
+    """
+    计算自监督损失（LFD + S_high），用于新框架
+    
+    Args:
+        z_specific_adjs: list of [N, d] 每个视图的节点表示
+        z_fused_adj: [N, d] 融合后的节点表示
+        specific_adjs: list of adj 静态视图邻接矩阵
+        temperature: LFD温度参数
+        h: （保留参数，未使用）
+        alpha: LFD权重
+        beta: S_high权重
+    
+    Returns:
+        total_loss, loss_details
+    """
+    num_views = len(z_specific_adjs)
+    
+    # 1. LFD损失: 让融合嵌入学习各视图的邻域聚合知识
+    lfd_loss_total = 0
+    for i in range(num_views):
+        lfd_loss = compute_lfd_loss_optimized(
+            z_teacher=z_specific_adjs[i],
+            h_student=z_fused_adj,
+            adj_teacher=specific_adjs[i],
+            temperature=temperature
+        )
+        lfd_loss_total += lfd_loss
+    lfd_loss_avg = lfd_loss_total / num_views
+    
+    # 2. S_High损失: 鼓励每个view在自己的图上保持平滑性（低高频能量）
+    s_high_same = [] 
+    s_high_cross = [] 
+    
+    for i in range(num_views):
+        s_high_same.append(compute_s_high(z_specific_adjs[i], specific_adjs[i]))
+    
+        for j in range(num_views):
+            if i != j:
+                s_high_cross.append(compute_s_high(z_specific_adjs[i], specific_adjs[j]))
 
-    return f_list
+    s_high_same_avg = torch.stack(s_high_same).mean()
+    s_high_cross_avg = torch.stack(s_high_cross).mean()
+   
+    s_high_loss_avg = torch.clamp(s_high_same_avg - s_high_cross_avg + 1.0, min=0.0)
+    
+    total_loss = (alpha * lfd_loss_avg + 
+                 beta * s_high_loss_avg)
+    
+    loss_details = {
+        'lfd_loss': lfd_loss_avg,
+        's_high_loss': s_high_loss_avg,
+        'total_loss': total_loss
+    }
+    return total_loss, loss_details
+
+
 #这个是对于融合前后一个点将融合前的一个点聚合它的邻居的特征值然后取平均值用kl散度取拉近这两者之间的距离
 def compute_lfd_loss_optimized(z_teacher, h_student, adj_teacher, temperature=1.0):
         device = z_teacher.device
@@ -306,47 +300,3 @@ def compute_s_high(x, adj):
     s_high_vals = numerator / (denominator + EPS)
     s_high = s_high_vals.mean()
     return s_high
-    #下面是第三个损失函数用在不同的视图的节点嵌入之间整体分布形状是否相似
-'''
-# Z_s_intra = gnn_encoder(X_s_intra, A_s_intra)
-# Z_s_global = gnn_encoder(X_s_global, A_s_global)
-
-# 计算 SC 损失
-sc_loss = compute_sc_loss(Z_s_intra, Z_s_global, h=1.0)
-'''
-def gaussian_kernel(x, y, h):
-    """
-    返回 (Nx, Ny) 的高斯核相似度矩阵
-    """
-    x = x.float()
-    y = y.float()
-    x_norm = (x ** 2).sum(dim=1).unsqueeze(1)  # (Nx,1)
-    y_norm = (y ** 2).sum(dim=1).unsqueeze(0)  # (1,Ny)
-    dist_sq = x_norm + y_norm - 2.0 * (x @ y.t())
-    dist_sq = torch.clamp(dist_sq, min=0.0)
-    K = torch.exp(-dist_sq / (2.0 * (h ** 2 + EPS)))
-    return K
-
-def js_divergence(P, Q):
-    """
-    P, Q: (1, M) 或 (M,) 估计分布（未必归一化）
-    返回：标量 JS 散度
-    """
-    P = P / (P.sum(dim=-1, keepdim=True) + EPS)
-    Q = Q / (Q.sum(dim=-1, keepdim=True) + EPS)
-    M = 0.5 * (P + Q)
-    # 使用 KL-div，先保证无零
-    kl_pm = F.kl_div((P + EPS).log(), M, reduction='batchmean')
-    kl_qm = F.kl_div((Q + EPS).log(), M, reduction='batchmean')
-    return 0.5 * (kl_pm + kl_qm)
-
-def compute_sc_loss(Z_s_intra, Z_s_global, h=1.0):
-    """
-    计算两个视图嵌入分布的分布相似性（JS divergence of kernel estimates）
-    """
-    K_intra_global = gaussian_kernel(Z_s_intra, Z_s_global, h)  # (N,N)
-    K_global_intra = gaussian_kernel(Z_s_global, Z_s_intra, h)  # (N,N)
-    P_est = K_intra_global.mean(dim=0, keepdim=True)  # (1, N)
-    Q_est = K_global_intra.mean(dim=0, keepdim=True)  # (1, N)
-    sc_loss = js_divergence(P_est, Q_est)
-    return sc_loss

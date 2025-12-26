@@ -177,7 +177,7 @@ def prepare_and_balance_data(feature_path, split, feature_type, augment_train=Tr
     return rows
 
 def process_split(split_name, rows, out_dir, feature_path, region_map, 
-                  k_intra, k_global, w1, w2, fs, device, batch_size, save_npy):
+                  k_global, w1, w2, fs, device, batch_size, save_npy):
     out = {}
     adjs_dir = os.path.join(feature_path, 'adjs_precomputed')
     safe_makedirs(adjs_dir)
@@ -202,8 +202,13 @@ def process_split(split_name, rows, out_dir, feature_path, region_map,
         S_global, _, _ = build_global_view(ts_np, w1=w1, w2=w2, fs=fs)
         print(f"S_global: shape={S_global.shape}, non-zero={np.count_nonzero(S_global)}, mean={np.mean(S_global):.6f}")
         
-        A_intra_sp = topk_sparsify_sym_row_normalize(G_intra, k_intra)
-        print(f"A_intra_sp: non-zero={np.count_nonzero(A_intra_sp)}, mean={np.mean(A_intra_sp):.6f}")
+        # 确保对角线为0（防止自环消耗边预算）
+        np.fill_diagonal(G_intra, 0.0)
+        np.fill_diagonal(S_global, 0.0)
+        
+        # 使用自适应 k_intra 稀疏化（按脑区大小自动调整）
+        A_intra_sp = topk_sparsify_adaptive_intra(G_intra, region_map)
+        print(f"A_intra_sp (adaptive): non-zero={np.count_nonzero(A_intra_sp)}, mean={np.mean(A_intra_sp):.6f}")
         
         A_global_sp = topk_sparsify_sym_row_normalize(S_global, k_global)
         print(f"A_global_sp: non-zero={np.count_nonzero(A_global_sp)}, mean={np.mean(A_global_sp):.6f}")
@@ -253,7 +258,7 @@ def run_on_gpu(rank, args, all_rows, splits, region_map):
             continue
 
         out_dict = process_split(split, part, args.out_dir, args.feature_path, region_map,
-                                 k_intra=args.k_intra, k_global=args.k_global,
+                                 k_global=args.k_global,
                                  w1=args.w1, w2=args.w2, fs=args.fs, device=device,
                                  batch_size=args.batch_size, save_npy=args.save_npy)
         results[split] = out_dict
@@ -264,47 +269,123 @@ def run_on_gpu(rank, args, all_rows, splits, region_map):
     print(f"Rank {rank} saved {out_file}")
 
 
+def load_and_split_all_data(feature_path, feature_type, train_ratio=0.7, val_ratio=0.1, test_ratio=0.2, random_seed=42):
+    """
+    加载所有数据并按照指定比例重新分割
+    train_ratio : val_ratio : test_ratio = 7:1:2
+    """
+    print("\n" + "="*80)
+    print("Step 1: Loading ALL original data and reshuffling...")
+    print("="*80)
+    
+    # 加载所有分割的原始数据
+    all_rows = []
+    for split in ['train', 'val', 'test']:
+        try:
+            feature_data = load_feature_pickle(feature_path, split)
+            rows = prepare_rows_from_feature_data(feature_data, feature_type)
+            all_rows.extend(rows)
+            print(f"Loaded {len(rows)} samples from {split}")
+        except FileNotFoundError:
+            print(f"Warning: {split}_data.pkl not found, skipping...")
+    
+    total_samples = len(all_rows)
+    print(f"\nTotal samples loaded: {total_samples}")
+    
+    # 统计原始类别分布
+    original_label_dist = Counter([r['labels'] for r in all_rows])
+    print(f"Original label distribution: {dict(original_label_dist)}")
+    
+    # 打乱数据
+    np.random.seed(random_seed)
+    random.seed(random_seed)
+    random.shuffle(all_rows)
+    print(f"Data shuffled with seed={random_seed}")
+    
+    # 按比例分割
+    n_train_val = int(total_samples * (train_ratio + val_ratio))
+    n_test = total_samples - n_train_val
+    
+    train_val_data = all_rows[:n_train_val]
+    test_data = all_rows[n_train_val:]
+    
+    print(f"\n" + "="*80)
+    print(f"Step 2: Initial Split (7:1:2)")
+    print(f"="*80)
+    print(f"Train+Val: {len(train_val_data)} samples ({len(train_val_data)/total_samples*100:.1f}%)")
+    print(f"Test (locked): {len(test_data)} samples ({len(test_data)/total_samples*100:.1f}%)")
+    print(f"  Test label distribution: {dict(Counter([r['labels'] for r in test_data]))}")
+    
+    return train_val_data, test_data
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--feature_path', type=str, required=True)
     parser.add_argument('--out_dir', type=str, default='processed_fnirs')
-    parser.add_argument('--k_intra', type=int, default=8)
+    # k_intra is now adaptive based on region size, no longer a command line argument
     parser.add_argument('--k_global', type=int, default=8)
     parser.add_argument('--w1', type=float, default=0.5)
     parser.add_argument('--w2', type=float, default=0.5)
-    parser.add_argument('--fs', type=float, default=1.0)
+    parser.add_argument('--fs', type=float, default=20.0)
     parser.add_argument('--feature_type', type=str, default='oxy')
     parser.add_argument('--node_out_size', type=int, default=32)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--nprocs', type=int, default=torch.cuda.device_count())
     parser.add_argument('--save_npy', type=bool, default=True, help='Save individual .npy files for each sample')
+    parser.add_argument('--random_seed', type=int, default=42, help='Random seed for data splitting')
     args = parser.parse_args()
 
-    splits = ['train', 'val', 'test']
-    all_rows = {}
-    for s in splits:
-        all_rows[s] = prepare_and_balance_data(args.feature_path, s, args.feature_type)
-        print(f"{s}: {len(all_rows[s])} samples | label dist: {Counter([r['labels'] for r in all_rows[s]])}")
-
+    # Step 1 & 2: 加载并重新分割数据 (7:1:2)
+    train_val_data, test_data = load_and_split_all_data(
+        args.feature_path, 
+        args.feature_type,
+        random_seed=args.random_seed
+    )
+    
+    # Step 3: 处理 Test 集 (独立保存,不做任何增强)
+    print("\n" + "="*80)
+    print("Step 3: Processing Test set (independent, no augmentation)")
+    print("="*80)
+    
+    # 获取 region_map
     region_map_path = os.path.join(args.feature_path, 'region_map.npy')
     if os.path.exists(region_map_path):
         region_map = np.load(region_map_path)
         print("Loaded region_map from", region_map_path)
     else:
-        C = all_rows['train'][0]['data'].shape[1]
+        if len(train_val_data) > 0:
+            C = train_val_data[0]['data'].shape[1]
+        elif len(test_data) > 0:
+            C = test_data[0]['data'].shape[1]
+        else:
+            raise ValueError("No data available to determine number of channels")
         region_map = make_region_map(brain_regions, C)
         np.save(region_map_path, region_map)
         print("Saved region_map to", region_map_path)
-
-
+    
     safe_makedirs(args.out_dir)
-
+    
+    # 处理 Test 集
+    all_rows = {'test': test_data}
+    splits = ['test']
+    
     if args.nprocs > 1 and torch.cuda.is_available():
         mp.spawn(run_on_gpu, nprocs=args.nprocs, args=(args, all_rows, splits, region_map), join=True)
     else:
         run_on_gpu(0, args, all_rows, splits, region_map)
-
-    merged_results = {s: {} for s in splits}
+    
+    # 打印自适应 k_intra 信息
+    print("\n" + "="*80)
+    print("Adaptive k_intra configuration:")
+    print("="*80)
+    for region_id, channels in enumerate(brain_regions):
+        n_r = len(channels)
+        k_r = max(1, int(np.ceil(0.5 * (n_r - 1))))
+        print(f"Region {region_id}: {n_r} channels -> k_intra = {k_r}")
+    print("="*80 + "\n")
+    
+    # 合并 Test 集结果
+    merged_results = {'test': {}}
     merged_files = []
     for fname in os.listdir(args.out_dir):
         if fname.startswith("processed_rank"):
@@ -312,30 +393,42 @@ def main():
             try:
                 with open(fpath, 'rb') as f:
                     part_dict = pickle.load(f)
-                for s in splits:
-                    if s in part_dict:
-                        merged_results[s].update(part_dict[s])
+                if 'test' in part_dict:
+                    merged_results['test'].update(part_dict['test'])
                 merged_files.append(fpath)
             except Exception as e:
                 print(f"Warning: Could not read {fpath}. Error: {e}")
-
-    for s in splits:
-        if merged_results[s]:
-            final_file = os.path.join(args.out_dir, f"processed_{s}.pkl")
-            with open(final_file, 'wb') as f:
-                pickle.dump(merged_results[s], f)
-            print(f"Successfully merged {len(merged_results[s])} samples for {s} split into {final_file}")
-        else:
-            print(f"Warning: No data to merge for {s} split.")
-
+    
+    # 保存 Test 集
+    if merged_results['test']:
+        final_file = os.path.join(args.out_dir, f"processed_test.pkl")
+        with open(final_file, 'wb') as f:
+            pickle.dump(merged_results['test'], f)
+        print(f"✓ Test set saved: {len(merged_results['test'])} samples -> {final_file}")
+    
     for fpath in merged_files:
         os.remove(fpath)
-    print("Cleaned up temporary files.")
-
-    if args.save_npy:
-        print("Finished. per-sample .npy saved under:", os.path.join(args.feature_path, 'adjs_precomputed'))
-    else:
-        print("Finished. Per-sample .npy files were not saved.")
+    
+    # Step 4: 保存 Train+Val 原始数据 (用于后续 K-Fold)
+    print("\n" + "="*80)
+    print("Step 4: Saving Train+Val data for K-Fold cross-validation")
+    print("="*80)
+    
+    train_val_file = os.path.join(args.out_dir, 'train_val_raw.pkl')
+    with open(train_val_file, 'wb') as f:
+        pickle.dump(train_val_data, f)
+    print(f"✓ Train+Val raw data saved: {len(train_val_data)} samples -> {train_val_file}")
+    print(f"  Label distribution: {dict(Counter([r['labels'] for r in train_val_data]))}")
+    
+    print("\n" + "="*80)
+    print("Preprocessing Complete!")
+    print("="*80)
+    print(f"Next steps:")
+    print(f"  1. Test set is ready at: {args.out_dir}/processed_test.pkl")
+    print(f"  2. Train+Val raw data is at: {args.out_dir}/train_val_raw.pkl")
+    print(f"  3. Use data_loader.py with K-Fold to split train_val_raw.pkl")
+    print(f"  4. Resampling will be done during training (not here)")
+    print("="*80)
 
 
 if __name__ == '__main__':
